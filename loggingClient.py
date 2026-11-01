@@ -3,8 +3,8 @@ from datetime import datetime
 from amqtt.client import MQTTClient, ClientError
 
 # PAMIĘTAJ: Zmień na swój adres IP Wi-Fi, jeśli uruchamiasz na innym urządzeniu!
-BROKER_URL = "mqtt://moj_uzytkownik:super_tajne_haslo@192.168.1.20:1883/"
-TOPIC = "dom/czujniki/#"  # '#' oznacza subskrypcję wszystkich podtematów
+BROKER_URL = "mqtt://klient_logu:haslo_klientu_logu@192.168.1.20:1883/"
+TOPIC = "test/topic/#"  # '#' oznacza subskrypcję wszystkich podtematów
 
 def zapisz_do_pliku(tekst):
     # Funkcja zapisująca odebrane dane do pliku tekstowego
