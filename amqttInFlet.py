@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logging.getLogger("amqtt.broker").addFilter(AmqttShutdownFilter())
 # ----------------------------------------
 
-# Globalna zmienna trzymająca referencję do funkcji logowania dla wtyczki
+# Globalna zmienna ze wskaźnikiem do funkcji zapisu logów dla wtyczki
 _gui_log_callback = None
 
 # --- WŁASNA WTYCZKA BROKERA DO MONITOROWANIA ZDARZEŃ ---
@@ -40,7 +40,7 @@ class BrokerMonitorPlugin(BasePlugin):
             _gui_log_callback(msg)
             
         # Gdyby klient łączył się ponownie, usuwamy go z listy czystych rozłączeń
-        self.clean_disconnects.discard(client_id)
+        self.handled_clients.discard(client_id)
 
         # Podpinamy się pod maszynę stanów tej konkretnej sesji, aby wykryć nagłe zerwanie sieci
         client_session.transitions.on_enter_disconnected(
@@ -79,6 +79,18 @@ class BrokerMonitorPlugin(BasePlugin):
             # System zamknął gniazdo TCP bez błędów - to zwykłe zamknięcie aplikacji klienta
             msg = f"[BROKER] Klient zakończył połączenie: ID={client_id}"
             
+        if _gui_log_callback:
+            _gui_log_callback(msg)
+            
+    async def on_broker_client_subscribed(self, *, client_id: str, topic: str, qos: int) -> None:
+        """Wykrywa subskrypcję klienta na temat."""
+        msg = f"[BROKER] Klient ID={client_id} zasubskrybował: {topic} (QoS={qos})"
+        if _gui_log_callback:
+            _gui_log_callback(msg)
+            
+    async def on_broker_client_unsubscribed(self, *, client_id: str, topic: str) -> None:
+        """Wykrywa rezygnację klienta z subskrypcji."""
+        msg = f"[BROKER] Klient ID={client_id} zrezygnował z subskrypcji: {topic}"
         if _gui_log_callback:
             _gui_log_callback(msg)
 
@@ -153,7 +165,7 @@ async def main(page: ft.Page):
         else:
             print(f"[Terminal po zamknięciu]: {text}")
 
-    # Rejestrujemy callback dla wtyczki, aby miała dostęp do logowania w GUI
+    # Rejestrujemy callback dla wtyczki, aby miała dostęp do zapisu logów w GUI
     _gui_log_callback = log_message
 
     async def send_click(e):
