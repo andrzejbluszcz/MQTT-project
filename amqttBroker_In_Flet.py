@@ -7,7 +7,11 @@ import flet as ft
 from amqtt.broker import Broker
 # from amqtt.client import MQTTClient
 from amqtt.plugins.base import BasePlugin  # Potrzebne do stworzenia wtyczki
-from amqtt.session import ApplicationMessage
+from amqtt.mqtt import MQTTPacket
+from amqtt.mqtt.packet import MQTTFixedHeader, MQTTPayload, MQTTVariableHeader
+from amqtt.session import Session, ApplicationMessage
+from amqtt.mqtt.publish import PublishPacket
+from amqtt.mqtt.packet import CONNECT, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE
 
 # --- KULOOPORNY FILTR LOGÓW DLA AMQTT ---
 class AmqttShutdownFilter(logging.Filter):
@@ -30,6 +34,22 @@ _gui_status_callback = None
 active_log_view = None
 active_page = None
 
+mqttPacketTypeNames = {
+    1: "CONNECT",       
+    2: "CONNACK",      #no payload
+    3: "PUBLISH",
+    4: "PUBACK",       #no payload
+    5: "PUBREC",       #no payload
+    6: "PUBREL",       #no payload
+    7: "PUBCOMP",      #no payload
+    8: "SUBSCRIBE",
+    9: "SUBACK",
+    10: "UNSUBSCRIBE",
+    11: "UNSUBACK",    #no payload
+    12: "PINGREQ",     #no payload
+    13: "PINGRESP",    #no payload
+    14: "DISCONNECT"   #no payload
+}
 # --- WŁASNA WTYCZKA BROKERA DO MONITOROWANIA ZDARZEŃ ---
 class BrokerMonitorPlugin(BasePlugin):
     """Wtyczka przechwytująca zdarzenia sieciowe wprost z jądra brokera."""
@@ -89,28 +109,29 @@ class BrokerMonitorPlugin(BasePlugin):
             
     async def on_broker_client_subscribed(self, *, client_id: str, topic: str, qos: int) -> None:
         """Wykrywa subskrypcję klienta na temat."""
-        msg = f"[BROKER] Klient ID={client_id} zasubskrybował: {topic} (QoS={qos})"
+        msg = f"[BROKER] Klient ID={client_id} zasubskrybował: '{topic}' (QoS={qos})"
         if _gui_log_callback:
             _gui_log_callback(msg)
             
     async def on_broker_client_unsubscribed(self, *, client_id: str, topic: str) -> None:
         """Wykrywa rezygnację klienta z subskrypcji."""
-        msg = f"[BROKER] Klient ID={client_id} zrezygnował z subskrypcji: {topic}"
+        msg = f"[BROKER] Klient ID={client_id} zrezygnował z subskrypcji: '{topic}'"
         if _gui_log_callback:
             _gui_log_callback(msg)
             
     async def on_broker_message_received(self, *, client_id: str, message: ApplicationMessage) -> None:
         """Wykrywa odebranie wiadomości od klienta."""
-        # decoded_msg = message.data.decode("utf-8")
-        decoded_msg = message.data[2:].decode("utf-8")
-        msg = f"[BROKER] Odebrano od klienta ID={client_id}: {message.topic} -> {decoded_msg}"
+        decoded_msg = message.data.decode("utf-8")
+        # decoded_msg = message.data[2:].decode("utf-8")
+        msg = f"[BROKER] Odebrano od klienta ID={client_id}: '{message.topic}' -> '{decoded_msg}'"
         if _gui_log_callback:
             _gui_log_callback(msg)
             
     async def on_broker_message_broadcast(self, *, client_id: str, message: ApplicationMessage) -> None:
         """Wykrywa wysłanie wiadomości do subskrybentów."""
-        decoded_msg = message.data[2:].decode("utf-8")
-        msg = f"[BROKER] Wysłano do subskrybentów ID={client_id}: {message.topic} -> {decoded_msg}"
+        decoded_msg = message.data.decode("utf-8")
+        # decoded_msg = message.data[2:].decode("utf-8")
+        msg = f"[BROKER] Wysłano do subskrybentów '{message.topic}' wiadomość '{decoded_msg}' od klienta '{client_id}'"
         if _gui_log_callback:
             _gui_log_callback(msg)
             
@@ -131,6 +152,52 @@ class BrokerMonitorPlugin(BasePlugin):
         msg = "Status Brokera: ZAMKNIĘTY"
         if _gui_status_callback:
             _gui_status_callback(msg)
+
+    async def on_mqtt_packet_sent(self, *, packet: MQTTPacket[MQTTVariableHeader, MQTTPayload[MQTTVariableHeader], MQTTFixedHeader], 
+                                  session: Session | None = None) -> None:
+        packetTypeNum = packet.fixed_header.packet_type
+        ptn = mqttPacketTypeNames.get(packetTypeNum, "UNKNOWN")
+        if isinstance(packet, PublishPacket):
+            topic = packet.variable_header.topic_name
+            payload = packet.payload.data or b""
+            text = payload.decode("utf-8", errors="replace")
+            msg = f"[WIADOMOŚĆ] wysłana {topic}: {text}"
+            if _gui_log_callback:
+                _gui_log_callback(msg)
+        else:
+            if packetTypeNum in [CONNECT, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE]:
+                try:
+                    payload_len = len(packet.payload.to_bytes())
+                except Exception:
+                    payload_len = 0
+                msg = f"[PAKIET PROTOKOŁU] wysłany typ={ptn}, długość={payload_len}"
+            else:
+                msg = f"[PAKIET PROTOKOŁU] wysłany typ={ptn}"
+            if _gui_log_callback:
+                _gui_log_callback(msg)
+            
+    async def on_mqtt_packet_received(self, *, packet: MQTTPacket[MQTTVariableHeader, MQTTPayload[MQTTVariableHeader], MQTTFixedHeader], 
+                                      session: Session | None = None) -> None:
+        packetTypeNum = packet.fixed_header.packet_type
+        ptn = mqttPacketTypeNames.get(packetTypeNum, "UNKNOWN")
+        if isinstance(packet, PublishPacket):
+            topic = packet.variable_header.topic_name
+            payload = packet.payload.data or b""
+            text = payload.decode("utf-8", errors="replace")
+            msg = f"[WIADOMOŚĆ] odebrana {topic}: {text}"
+            if _gui_log_callback:
+                _gui_log_callback(msg)
+        else:
+            if packetTypeNum in [CONNECT, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE]:
+                try:
+                    payload_len = len(packet.payload.to_bytes())
+                except Exception:
+                    payload_len = 0
+                msg = f"[PAKIET PROTOKOŁU] odebrany typ={ptn}, długość={payload_len}"
+            else:
+                msg = f"[PAKIET PROTOKOŁU] odebrany typ={ptn}"
+            if _gui_log_callback:
+                _gui_log_callback(msg)
 
     def _handle_sudden_disconnect(self, client_id: str, client_session):
         """Sprawdza maszynę stanów sesji i wykrywa nagłą utratę połączenia."""
@@ -205,6 +272,7 @@ async def main(page: ft.Page):
     _gui_log_callback = log_message
     
     def status_message(text: str):
+        # TODO: is_running = broker_instance.transitions.state == "started"
         nonlocal is_gui_active
         if is_gui_active:
             try:

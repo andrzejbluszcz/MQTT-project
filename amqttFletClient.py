@@ -1,20 +1,135 @@
 import asyncio
+from amqtt.mqtt import packet
 import flet as ft
 from flet import run
 from amqtt.client import MQTTClient, ClientError
+from amqtt.plugins.base import BasePlugin  # Potrzebne do stworzenia wtyczki
+from amqtt.mqtt import MQTTPacket
+from amqtt.mqtt.packet import MQTTFixedHeader, MQTTPayload, MQTTVariableHeader
+from amqtt.session import Session
+from amqtt.mqtt.publish import PublishPacket
+from amqtt.mqtt.packet import CONNECT, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE
 
-BROKER_URL = "mqtt://127.0.0.1:1883/"
+# Konstrukcja URL: mqtt://użytkownik:hasło@IP_brokera:port/
+BROKER_URL = "mqtt://moj_klient:haslo_mojego_klienta@127.0.0.1:1883/"
+# Generacja haseł dla użytkowników w pliku passwd.txt:
+# 1. Utwórz plik passwd.txt w tym samym katalogu co asyncClient.py
+# 2. W terminalu uruchom poniższe polecenia (zmień użytkownika i hasło):
+#    python -c "from pwdlib import PasswordHash; print(PasswordHash.recommended().hash('haslo_czujnika_1'))"
+CLIENT_CONFIG = {
+    "keep_alive": 60,
+	"ping_delay": 6,
+	"broker": {
+	    "uri": "mqtt://moj_klient:haslo_mojego_klienta@127.0.0.1:1883/",
+	},
+    # Umieszczamy wtyczkę oraz jej parametry bezpośrednio w słowniku "plugins".
+    # Tylko w ten sposób amqtt prawidłowo powiąże bazę użytkowników z silnikiem.
+    "plugins": {
+        "amqtt.plugins.logging_amqtt.EventLoggerPlugin": {},
+        # Rejestrujemy naszą własną klasę wtyczki bez używania stringów (bezpieczne dla exe!)
+        "__main__.ClientMonitorPlugin": {}
+    }
+}
+
+_gui_log_callback = None
+
+mqttPacketTypeNames = {
+    1: "CONNECT",       
+    2: "CONNACK",      #no payload
+    3: "PUBLISH",
+    4: "PUBACK",       #no payload
+    5: "PUBREC",       #no payload
+    6: "PUBREL",       #no payload
+    7: "PUBCOMP",      #no payload
+    8: "SUBSCRIBE",
+    9: "SUBACK",
+    10: "UNSUBSCRIBE",
+    11: "UNSUBACK",    #no payload
+    12: "PINGREQ",     #no payload
+    13: "PINGRESP",    #no payload
+    14: "DISCONNECT"   #no payload
+}
+class ClientMonitorPlugin(BasePlugin):
+    """
+    Wtyczka monitorująca zdarzenia klienta MQTT.
+    Loguje wszystkie zdarzenia do konsoli i może być rozszerzona o dodatkowe funkcje.
+    """
+    def __init__(self, context):
+        super().__init__(context)
+
+    async def on_mqtt_packet_sent(self, *, packet: MQTTPacket[MQTTVariableHeader, MQTTPayload[MQTTVariableHeader], MQTTFixedHeader], 
+                                  session: Session | None = None) -> None:
+        packetTypeNum = packet.fixed_header.packet_type
+        ptn = mqttPacketTypeNames.get(packetTypeNum, "UNKNOWN")
+        if isinstance(packet, PublishPacket):
+            topic = packet.variable_header.topic_name
+            payload = packet.payload.data or b""
+            text = payload.decode("utf-8", errors="replace")
+            msg = f"[WIADOMOŚĆ] wysłana {topic}: {text}"
+            if _gui_log_callback:
+                _gui_log_callback(msg)
+        else:
+            if packetTypeNum in [CONNECT, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE]:
+                try:
+                    payload_len = len(packet.payload.to_bytes())
+                except Exception:
+                    payload_len = 0
+                msg = f"[PAKIET PROTOKOŁU] wysłany typ={ptn}, długość={payload_len}"
+            else:
+                msg = f"[PAKIET PROTOKOŁU] wysłany typ={ptn}"
+            if _gui_log_callback:
+                _gui_log_callback(msg)
+            
+    async def on_mqtt_packet_received(self, *, packet: MQTTPacket[MQTTVariableHeader, MQTTPayload[MQTTVariableHeader], MQTTFixedHeader], 
+                                      session: Session | None = None) -> None:
+        packetTypeNum = packet.fixed_header.packet_type
+        ptn = mqttPacketTypeNames.get(packetTypeNum, "UNKNOWN")
+        if isinstance(packet, PublishPacket):
+            topic = packet.variable_header.topic_name
+            payload = packet.payload.data or b""
+            text = payload.decode("utf-8", errors="replace")
+            msg = f"[WIADOMOŚĆ] odebrana {topic}: {text}"
+            if _gui_log_callback:
+                _gui_log_callback(msg)
+        else:
+            if packetTypeNum in [CONNECT, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE]:
+                try:
+                    payload_len = len(packet.payload.to_bytes())
+                except Exception:
+                    payload_len = 0
+                msg = f"[PAKIET PROTOKOŁU] odebrany typ={ptn}, długość={payload_len}"
+            else:
+                msg = f"[PAKIET PROTOKOŁU] odebrany typ={ptn}"
+            if _gui_log_callback:
+                _gui_log_callback(msg)
 
 def main(page: ft.Page):
+    global _gui_log_callback
     page.title = "Panel Sterowania - Klient MQTT"
-    page.width = 500
-    page.height = 450
+    page.window.width = 500
+    page.window.height = 450
     
-    client = MQTTClient()
+    client = MQTTClient(config=CLIENT_CONFIG)
     status_text = ft.Text("Status: Rozłączony", color=ft.Colors.ORANGE, weight=ft.FontWeight.BOLD)
     logs_list = ft.ListView(expand=True, spacing=3, auto_scroll=True)
     profile_input = ft.TextField(label="ID Profilu Zwift", value="user_123", width=250)
+    is_gui_active = True  # Flaga do sprawdzania, czy GUI jest aktywne
     
+    # --- POPRAWIONA FUNKCJA LOGOWANIA ---
+    def log_message(text: str):
+        nonlocal is_gui_active
+        if is_gui_active:
+            try:
+                logs_list.controls.append(ft.Text(text))
+                page.update()  # To teraz na pewno zadziała w oknie programu
+            except Exception:
+                is_gui_active = False
+                print(f"[Terminal]: {text}")
+        else:
+            print(f"[Terminal po zamknięciu]: {text}")
+
+    # Rejestrujemy callback dla wtyczki, aby miała dostęp do zapisu logów w GUI
+    _gui_log_callback = log_message
     # Przechowujemy referencję do zadania sieciowego
     network_task = None
 
@@ -27,7 +142,7 @@ def main(page: ft.Page):
         # Tutaj nie potrzebujemy os._exit, Flet sam zamknie proces po zniszczeniu sesji
     page.on_disconnect = on_disconnect_async
     
-    connect_btn = ft.Button(content="Połącz z bazą", icon=ft.Icons.CAST)
+    connect_btn = ft.Button(content="Połącz z brokerem", icon=ft.Icons.CAST)
     disconnect_btn = ft.Button(content="Rozłącz", icon=ft.Icons.CAST_CONNECTED, disabled=True)
     send_btn = ft.Button(content="Wyślij 'Ride On'", icon=ft.Icons.THUMB_UP, disabled=True)
 
