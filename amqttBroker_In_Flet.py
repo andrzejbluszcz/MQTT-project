@@ -1,17 +1,16 @@
 # https://amqtt.readthedocs.io/en/v0.11.3/
 # https://flet.dev/docs/
-
+# TODO: dodać obsługę niektórych 'trnasitions' w maszynie stanów brokera, np. 'broker.transitions.on_enter_stopping()' i 'broker.transitions.on_enter_started()'
 import asyncio
 import logging
+import os
 import flet as ft
 from amqtt.broker import Broker
-# from amqtt.client import MQTTClient
-from amqtt.plugins.base import BasePlugin  # Potrzebne do stworzenia wtyczki
+from amqtt.plugins.base import BasePlugin
 from amqtt.mqtt import MQTTPacket
-from amqtt.mqtt.packet import MQTTFixedHeader, MQTTPayload, MQTTVariableHeader
+from amqtt.mqtt.packet import MQTTFixedHeader, MQTTPayload, MQTTVariableHeader, CONNECT, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE
 from amqtt.session import Session, ApplicationMessage
 from amqtt.mqtt.publish import PublishPacket
-from amqtt.mqtt.packet import CONNECT, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE
 
 # --- KULOOPORNY FILTR LOGÓW DLA AMQTT ---
 class AmqttShutdownFilter(logging.Filter):
@@ -207,6 +206,9 @@ class BrokerMonitorPlugin(BasePlugin):
             if _gui_log_callback:
                 _gui_log_callback(msg)
 
+BROKER_PLUGIN_NAME = __name__ + ".BrokerMonitorPlugin" if __name__ != "__main__" else "__main__.BrokerMonitorPlugin"
+BROKER_PASSWD_PATH = os.path.join(os.path.dirname(__file__) or ".", "passwd.txt")
+
 BROKER_CONFIG = {
     "listeners": {
         "default": {
@@ -216,14 +218,13 @@ BROKER_CONFIG = {
     },
     "sys_interval": 0,
     # Umieszczamy wtyczkę oraz jej parametry bezpośrednio w słowniku "plugins".
-    # Tylko w ten sposób amqtt prawidłowo powiąże bazę użytkowników z silnikiem.
     "plugins": {
         "amqtt.plugins.logging_amqtt.EventLoggerPlugin": {},
         "amqtt.plugins.authentication.FileAuthPlugin": {
-            "password_file": "passwd.txt"  # Klucz z myślnikiem!
+            "password_file": BROKER_PASSWD_PATH
         },
-        # Rejestrujemy naszą własną klasę wtyczki bez używania stringów (bezpieczne dla exe!)
-        "__main__.BrokerMonitorPlugin": {}
+        # Rejestrujemy naszą własną klasę wtyczki
+        BROKER_PLUGIN_NAME: {}
     }
 }
 
@@ -254,32 +255,46 @@ async def main(page: ft.Page):
 
     # --- Elementy interfejsu ---
     log_column = ft.Column(scroll=ft.ScrollMode.AUTO, auto_scroll = True, expand=True)
+    status_text = ft.Text("Status Brokera: Wyłączony", color=ft.Colors.RED, weight=ft.FontWeight.BOLD)
 
     # --- POPRAWIONA FUNKCJA LOGOWANIA ---
-    def log_message(text: str):
+    def log_message(text: str, *, level: str = "INFO", color: str | None = None):
         nonlocal is_gui_active
+        prefix = {
+            "INFO": "[INFO]",
+            "WARN": "[WARN]",
+            "ERROR": "[ERROR]",
+            "OK": "[OK]",
+        }.get(level.upper(), "[INFO]")
+        final_text = f"{prefix} {text}"
         if is_gui_active:
             try:
-                log_column.controls.append(ft.Text(text))
-                page.update()  # To teraz na pewno zadziała w oknie programu
+                log_column.controls.append(ft.Text(final_text, color=color if color else ft.Colors.ON_SURFACE))
+                log_column.scroll_to(offset=999999, duration=0)
+                page.update()
             except Exception:
                 is_gui_active = False
-                print(f"[Terminal]: {text}")
+                print(f"[Terminal]: {final_text}")
         else:
-            print(f"[Terminal po zamknięciu]: {text}")
+            print(f"[Terminal po zamknięciu]: {final_text}")
 
     # Rejestrujemy callback dla wtyczki, aby miała dostęp do zapisu logów w GUI
     _gui_log_callback = log_message
     
     def status_message(text: str):
-        # TODO: is_running = broker_instance.transitions.state == "started"
         nonlocal is_gui_active
         if is_gui_active:
             try:
                 if text == "Status Brokera: DZIAŁA":
                     status_text.color = ft.Colors.GREEN
-                else:
+                elif text in {"Status Brokera: ZAMKNIĘTY", "Status Brokera: Zatrzymany", "Status Brokera: BŁĄD STARTU"}:
                     status_text.color = ft.Colors.RED
+                elif text == "Status Brokera: Zatrzymywanie...":
+                    status_text.color = ft.Colors.ORANGE
+                elif text == "Status Brokera: Uruchamianie...":
+                    status_text.color = ft.Colors.ORANGE
+                else:
+                    status_text.color = ft.Colors.ORANGE
                 status_text.value = text
                 page.update()
             except Exception:
@@ -287,56 +302,93 @@ async def main(page: ft.Page):
                 print(f"[Terminal]: {text}")
         else:
             print(f"[Terminal po zamknięciu]: {text}")
-            
+
+    def reset_broker_controls():
+        start_btn.disabled = False
+        stop_btn.disabled = True
+        page.update()
+    
     _gui_status_callback = status_message
 
     broker_instance = None
     broker_task = None
     broker_stop_event: asyncio.Event | None = None
 
+    def moj_log_polaczenia():
+        log_message("Testowy log uruchomienia brokera MQTT", level="OK", color=ft.Colors.GREEN)
+        status_message("Status Brokera: DZIAŁA")
+        
+    def moj_log_rozlaczenia():
+        log_message("Testowy log zatrzymania brokera MQTT", level="INFO", color=ft.Colors.BLUE)
+        status_message("Status Brokera: Zatrzymany")
+        
     async def start_broker_task(stop_event: asyncio.Event):
-        nonlocal broker_instance
-        broker_instance = Broker(BROKER_CONFIG)
+        nonlocal broker_instance, broker_task, broker_stop_event
+        broker_instance = None
         try:
+            broker_instance = Broker(BROKER_CONFIG)
+            broker_instance.transitions.on_enter_started(moj_log_polaczenia)
+            broker_instance.transitions.on_enter_stopping(lambda: status_message("Status Brokera: Zatrzymywanie..."))
+            broker_instance.transitions.on_enter_stopped(moj_log_rozlaczenia)
+            broker_instance.transitions.on_exit_started(lambda: log_message("[BROKER] wyjście ze stanu started"))
+
             await broker_instance.start()
+            status_message("Status Brokera: DZIAŁA")
             await stop_event.wait()
+        except asyncio.CancelledError:
+            log_message("Wątek brokera został anulowany.", level="WARN", color=ft.Colors.ORANGE)
+            status_message("Status Brokera: Zatrzymany")
+        except Exception as exc:
+            log_message(f"Błąd startu lub pracy brokera: {exc}", level="ERROR", color=ft.Colors.RED)
+            status_message("Status Brokera: BŁĄD STARTU")
         finally:
-            if broker_instance:
-                await broker_instance.shutdown()
-            status_text.value = "Status Brokera: Zatrzymany"
-            status_text.color = ft.Colors.RED
-            start_btn.disabled = False
-            stop_btn.disabled = True
-            page.update()
+            if broker_instance is not None:
+                try:
+                    await broker_instance.shutdown()
+                except Exception as exc:
+                    log_message(f"Shutdown zakończony błędem: {exc}", level="ERROR", color=ft.Colors.RED)
+            status_message("Status Brokera: Zatrzymany")
+            reset_broker_controls()
+            broker_instance = None
+            broker_task = None
+            broker_stop_event = None
 
     start_btn = ft.Button(content="Uruchom", icon=ft.Icons.PLAY_ARROW)
     stop_btn = ft.Button(content="Zatrzymaj", icon=ft.Icons.STOP, disabled=True)
-    status_text = ft.Text("Status Brokera: Wyłączony", color=ft.Colors.RED, weight=ft.FontWeight.BOLD)
+    clear_log_btn = ft.Button(content="Wyczyść log", icon=ft.Icons.CLEANING_SERVICES_ROUNDED)
+
+    def clear_log(e):
+        log_column.controls.clear()
+        log_message("Log został wyczyszczony.", level="INFO", color=ft.Colors.GREY_600)
+        page.update()
 
     def on_start(e):
+        nonlocal broker_task, broker_stop_event
+        if broker_task is not None and not broker_task.done():
+            return
         start_btn.disabled = True
         stop_btn.disabled = False
-        nonlocal broker_task, broker_stop_event
+        status_message("Status Brokera: Uruchamianie...")
         stop_event = asyncio.Event()
         broker_stop_event = stop_event
         broker_task = page.run_task(start_broker_task, stop_event)
         page.update()
 
     def on_stop(e):
-        status_text.value = "Status Brokera: Zatrzymywanie..."
-        page.update()
-        if broker_stop_event:
+        status_message("Status Brokera: Zatrzymywanie...")
+        if broker_stop_event is not None:
             broker_stop_event.set()
 
     start_btn.on_click = on_start
     stop_btn.on_click = on_stop
+    clear_log_btn.on_click = clear_log
     
     page.add(
         ft.Container(
             content=ft.Column(
                 [
                     ft.Text("Panel Brokera MQTT", size=20, weight=ft.FontWeight.BOLD),
-                    ft.Row([start_btn, stop_btn, status_text], alignment=ft.MainAxisAlignment.START, spacing=20),
+                    ft.Row([start_btn, stop_btn, clear_log_btn, status_text], alignment=ft.MainAxisAlignment.START, spacing=20),
                     ft.Text("Wiadomości:", weight=ft.FontWeight.BOLD),
                     ft.Container(
                         content=log_column,
@@ -362,7 +414,9 @@ async def main(page: ft.Page):
                 if broker_stop_event:
                     broker_stop_event.set()
                 try:
-                    await asyncio.wrap_future(broker_task)
+                    await broker_task
+                except asyncio.CancelledError:
+                    pass
                 finally:
                     await page.window.destroy()
             else:

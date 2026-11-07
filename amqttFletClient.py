@@ -1,14 +1,12 @@
 import asyncio
-from amqtt.mqtt import packet
 import flet as ft
 from flet import run
 from amqtt.client import MQTTClient, ClientError
-from amqtt.plugins.base import BasePlugin  # Potrzebne do stworzenia wtyczki
+from amqtt.plugins.base import BasePlugin
 from amqtt.mqtt import MQTTPacket
-from amqtt.mqtt.packet import MQTTFixedHeader, MQTTPayload, MQTTVariableHeader
+from amqtt.mqtt.packet import MQTTFixedHeader, MQTTPayload, MQTTVariableHeader, CONNECT, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE
 from amqtt.session import Session
 from amqtt.mqtt.publish import PublishPacket
-from amqtt.mqtt.packet import CONNECT, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE
 
 # Konstrukcja URL: mqtt://użytkownik:hasło@IP_brokera:port/
 BROKER_URL = "mqtt://moj_klient:haslo_mojego_klienta@127.0.0.1:1883/"
@@ -23,10 +21,8 @@ CLIENT_CONFIG = {
 	    "uri": "mqtt://moj_klient:haslo_mojego_klienta@127.0.0.1:1883/",
 	},
     # Umieszczamy wtyczkę oraz jej parametry bezpośrednio w słowniku "plugins".
-    # Tylko w ten sposób amqtt prawidłowo powiąże bazę użytkowników z silnikiem.
     "plugins": {
         "amqtt.plugins.logging_amqtt.EventLoggerPlugin": {},
-        # Rejestrujemy naszą własną klasę wtyczki bez używania stringów (bezpieczne dla exe!)
         "__main__.ClientMonitorPlugin": {}
     }
 }
