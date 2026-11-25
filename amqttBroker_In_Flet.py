@@ -1,24 +1,36 @@
 # https://amqtt.readthedocs.io/en/v0.11.3/
 # https://flet.dev/docs/
-# TODO: dodać obsługę niektórych 'trnasitions' w maszynie stanów brokera, np. 'broker.transitions.on_enter_stopping()' i 'broker.transitions.on_enter_started()'
+# DONE: dodać obsługę niektórych 'transitions' w maszynie stanów brokera,
+# np. 'broker.transitions.on_enter_stopping()'
+# i 'broker.transitions.on_enter_started()'
 import asyncio
 import logging
 import os
+
 import flet as ft
 from amqtt.broker import Broker
-from amqtt.plugins.base import BasePlugin
 from amqtt.mqtt import MQTTPacket
-from amqtt.mqtt.packet import MQTTFixedHeader, MQTTPayload, MQTTVariableHeader, CONNECT, PUBLISH, SUBSCRIBE, SUBACK, UNSUBSCRIBE
-from amqtt.session import Session, ApplicationMessage
+from amqtt.mqtt.packet import (
+    CONNECT,
+    PUBLISH,
+    SUBACK,
+    SUBSCRIBE,
+    UNSUBSCRIBE,
+    MQTTFixedHeader,
+    MQTTPayload,
+    MQTTVariableHeader,
+)
 from amqtt.mqtt.publish import PublishPacket
+from amqtt.plugins.base import BasePlugin
+from amqtt.session import ApplicationMessage, Session
+
 
 # --- KULOOPORNY FILTR LOGÓW DLA AMQTT ---
 class AmqttShutdownFilter(logging.Filter):
     def filter(self, record):
         # Jeśli komunikat zawiera informację o przerwaniu pętli broadcast, ucisz go
-        if "Broadcast loop stopped by exception" in record.getMessage():
-            return False
-        return True
+        return "Broadcast loop stopped by exception" not in record.getMessage()
+
 
 # Konfiguracja logowania
 logging.basicConfig(level=logging.INFO)
@@ -29,49 +41,62 @@ logging.getLogger("amqtt.broker").addFilter(AmqttShutdownFilter())
 # Globalna zmienna ze wskaźnikiem do funkcji zapisu logów dla wtyczki
 _gui_log_callback = None
 _gui_status_callback = None
-# Zmienne globalne, do których wtyczka uzyska bezpośredni dostęp bez modyfikacji configu amqtt
+# Zmienne globalne, do których wtyczka uzyska bezpośredni dostęp
+# bez modyfikacji configu amqtt
 active_log_view = None
 active_page = None
 
 mqttPacketTypeNames = {
-    1: "CONNECT",       
-    2: "CONNACK",      #no payload
+    1: "CONNECT",
+    2: "CONNACK",  # no payload
     3: "PUBLISH",
-    4: "PUBACK",       #no payload
-    5: "PUBREC",       #no payload
-    6: "PUBREL",       #no payload
-    7: "PUBCOMP",      #no payload
+    4: "PUBACK",  # no payload
+    5: "PUBREC",  # no payload
+    6: "PUBREL",  # no payload
+    7: "PUBCOMP",  # no payload
     8: "SUBSCRIBE",
     9: "SUBACK",
     10: "UNSUBSCRIBE",
-    11: "UNSUBACK",    #no payload
-    12: "PINGREQ",     #no payload
-    13: "PINGRESP",    #no payload
-    14: "DISCONNECT"   #no payload
+    11: "UNSUBACK",  # no payload
+    12: "PINGREQ",  # no payload
+    13: "PINGRESP",  # no payload
+    14: "DISCONNECT",  # no payload
 }
+
+
 # --- WŁASNA WTYCZKA BROKERA DO MONITOROWANIA ZDARZEŃ ---
 class BrokerMonitorPlugin(BasePlugin):
     """Wtyczka przechwytująca zdarzenia sieciowe wprost z jądra brokera."""
-    
+
     def __init__(self, context):
         super().__init__(context)
         self.handled_clients = set()
-    
-    async def on_broker_client_connected(self, *, client_id: str, client_session) -> None:
+
+    async def on_broker_client_connected(
+        self, *, client_id: str, client_session
+    ) -> None:
         """Wykrywa nowe, udane połączenie klienta."""
-        msg = f"[BROKER INTERFEJS] Nowy klient połączony: ID={client_id} z adresu {client_session.remote_address}"
+        msg = (
+            f"[BROKER INTERFEJS] Nowy klient połączony: ID={client_id} "
+            f"z adresu {client_session.remote_address}"
+        )
         if _gui_log_callback:
             _gui_log_callback(msg)
-            
+
         # Gdyby klient łączył się ponownie, usuwamy go z listy czystych rozłączeń
         self.handled_clients.discard(client_id)
 
-        # Podpinamy się pod maszynę stanów tej konkretnej sesji, aby wykryć nagłe zerwanie sieci
+        # Podpinamy się pod maszynę stanów tej konkretnej sesji,
+        # aby wykryć nagłe zerwanie sieci
         client_session.transitions.on_enter_disconnected(
-            lambda: asyncio.create_task(self._handle_disconnect_event(client_id, client_session))
-       )
+            lambda: asyncio.create_task(
+                self._handle_disconnect_event(client_id, client_session)
+            )
+        )
 
-    async def on_broker_client_disconnected(self, *, client_id: str, client_session) -> None:
+    async def on_broker_client_disconnected(
+        self, *, client_id: str, client_session
+    ) -> None:
         """Wykrywa normalne rozłączenie (gdy pakiet DISCONNECT zdąży dotrzeć)."""
         if client_id not in self.handled_clients:
             self.handled_clients.add(client_id)
@@ -82,58 +107,77 @@ class BrokerMonitorPlugin(BasePlugin):
     async def _handle_disconnect_event(self, client_id: str, client_session):
         """Sprawdza realny powód zamknięcia połączenia na poziomie sieci TCP."""
         await asyncio.sleep(0.05)  # Krótka pauza na synchronizację stanów
-        
+
         if client_id in self.handled_clients:
             return  # Klient został już obsłużony przez on_broker_client_disconnected
 
         self.handled_clients.add(client_id)
 
         # Sprawdzamy, czy w obiekcie sesji lub strumienia pojawił się błąd połączenia.
-        # Jeśli połączenie zostało zamknięte bez błędów (np. szybki koniec skryptu klienta),
+        # Jeśli połączenie zostało zamknięte bez błędów
+        # (np. szybki koniec skryptu klienta),
         # traktujemy to jako normalne zamknięcie programu.
-        reader = getattr(client_session, 'reader', None)
+        reader = getattr(client_session, "reader", None)
         has_network_error = False
-        
-        if reader and hasattr(reader, '_exception') and reader._exception is not None:
+
+        if reader and hasattr(reader, "_exception") and reader._exception is not None:
             has_network_error = True
 
         if has_network_error:
-            msg = f"[BROKER] ⚠️ UTRACONO POŁĄCZENIE z klientem: ID={client_id} (Awaria / brak sieci)"
+            msg = (
+                f"[BROKER] ⚠️ UTRACONO POŁĄCZENIE z klientem: ID={client_id} "
+                "(Awaria / brak sieci)"
+            )
         else:
-            # System zamknął gniazdo TCP bez błędów - to zwykłe zamknięcie aplikacji klienta
+            # System zamknął gniazdo TCP bez błędów
+            # - to zwykłe zamknięcie aplikacji klienta
             msg = f"[BROKER] Klient zakończył połączenie: ID={client_id}"
-            
+
         if _gui_log_callback:
             _gui_log_callback(msg)
-            
-    async def on_broker_client_subscribed(self, *, client_id: str, topic: str, qos: int) -> None:
+
+    async def on_broker_client_subscribed(
+        self, *, client_id: str, topic: str, qos: int
+    ) -> None:
         """Wykrywa subskrypcję klienta na temat."""
         msg = f"[BROKER] Klient ID={client_id} zasubskrybował: '{topic}' (QoS={qos})"
         if _gui_log_callback:
             _gui_log_callback(msg)
-            
-    async def on_broker_client_unsubscribed(self, *, client_id: str, topic: str) -> None:
+
+    async def on_broker_client_unsubscribed(
+        self, *, client_id: str, topic: str
+    ) -> None:
         """Wykrywa rezygnację klienta z subskrypcji."""
         msg = f"[BROKER] Klient ID={client_id} zrezygnował z subskrypcji: '{topic}'"
         if _gui_log_callback:
             _gui_log_callback(msg)
-            
-    async def on_broker_message_received(self, *, client_id: str, message: ApplicationMessage) -> None:
+
+    async def on_broker_message_received(
+        self, *, client_id: str, message: ApplicationMessage
+    ) -> None:
         """Wykrywa odebranie wiadomości od klienta."""
         decoded_msg = message.data.decode("utf-8")
         # decoded_msg = message.data[2:].decode("utf-8")
-        msg = f"[BROKER] Odebrano od klienta ID={client_id}: '{message.topic}' -> '{decoded_msg}'"
+        msg = (
+            f"[BROKER] Odebrano od klienta ID={client_id}: "
+            f"'{message.topic}' -> '{decoded_msg}'"
+        )
         if _gui_log_callback:
             _gui_log_callback(msg)
-            
-    async def on_broker_message_broadcast(self, *, client_id: str, message: ApplicationMessage) -> None:
+
+    async def on_broker_message_broadcast(
+        self, *, client_id: str, message: ApplicationMessage
+    ) -> None:
         """Wykrywa wysłanie wiadomości do subskrybentów."""
         decoded_msg = message.data.decode("utf-8")
         # decoded_msg = message.data[2:].decode("utf-8")
-        msg = f"[BROKER] Wysłano do subskrybentów '{message.topic}' wiadomość '{decoded_msg}' od klienta '{client_id}'"
+        msg = (
+            f"[BROKER] Wysłano do subskrybentów '{message.topic}' "
+            f"wiadomość '{decoded_msg}' od klienta '{client_id}'"
+        )
         if _gui_log_callback:
             _gui_log_callback(msg)
-            
+
     async def on_broker_post_start(self) -> None:
         """Wykrywa uruchomienie brokera."""
         msg = "[BROKER] Broker został uruchomiony i działa online."
@@ -142,7 +186,7 @@ class BrokerMonitorPlugin(BasePlugin):
         msg = "Status Brokera: DZIAŁA"
         if _gui_status_callback:
             _gui_status_callback(msg)
-            
+
     async def on_broker_post_shutdown(self) -> None:
         """Wykrywa zamknięcie brokera."""
         msg = "[BROKER] Broker został bezpiecznie zamknięty."
@@ -152,8 +196,14 @@ class BrokerMonitorPlugin(BasePlugin):
         if _gui_status_callback:
             _gui_status_callback(msg)
 
-    async def on_mqtt_packet_sent(self, *, packet: MQTTPacket[MQTTVariableHeader, MQTTPayload[MQTTVariableHeader], MQTTFixedHeader], 
-                                  session: Session | None = None) -> None:
+    async def on_mqtt_packet_sent(
+        self,
+        *,
+        packet: MQTTPacket[
+            MQTTVariableHeader, MQTTPayload[MQTTVariableHeader], MQTTFixedHeader
+        ],
+        session: Session | None = None,
+    ) -> None:
         packetTypeNum = packet.fixed_header.packet_type
         ptn = mqttPacketTypeNames.get(packetTypeNum, "UNKNOWN")
         if isinstance(packet, PublishPacket):
@@ -168,15 +218,29 @@ class BrokerMonitorPlugin(BasePlugin):
                 try:
                     payload_len = len(packet.payload.to_bytes())
                 except Exception:
-                    payload_len = 0
-                msg = f"[PAKIET PROTOKOŁU] wysłany typ={ptn}, długość={payload_len}"
+                    logging.getLogger(__name__).exception(
+                        "Nie udało się odczytać długości wysyłanego payloadu."
+                    )
+                    payload_len = None
+                payload_len_text = (
+                    str(payload_len) if payload_len is not None else "nieznana"
+                )
+                msg = (
+                    f"[PAKIET PROTOKOŁU] wysłany typ={ptn}, długość={payload_len_text}"
+                )
             else:
                 msg = f"[PAKIET PROTOKOŁU] wysłany typ={ptn}"
             if _gui_log_callback:
                 _gui_log_callback(msg)
-            
-    async def on_mqtt_packet_received(self, *, packet: MQTTPacket[MQTTVariableHeader, MQTTPayload[MQTTVariableHeader], MQTTFixedHeader], 
-                                      session: Session | None = None) -> None:
+
+    async def on_mqtt_packet_received(
+        self,
+        *,
+        packet: MQTTPacket[
+            MQTTVariableHeader, MQTTPayload[MQTTVariableHeader], MQTTFixedHeader
+        ],
+        session: Session | None = None,
+    ) -> None:
         packetTypeNum = packet.fixed_header.packet_type
         ptn = mqttPacketTypeNames.get(packetTypeNum, "UNKNOWN")
         if isinstance(packet, PublishPacket):
@@ -191,8 +255,16 @@ class BrokerMonitorPlugin(BasePlugin):
                 try:
                     payload_len = len(packet.payload.to_bytes())
                 except Exception:
-                    payload_len = 0
-                msg = f"[PAKIET PROTOKOŁU] odebrany typ={ptn}, długość={payload_len}"
+                    logging.getLogger(__name__).exception(
+                        "Nie udało się odczytać długości odbieranego payloadu."
+                    )
+                    payload_len = None
+                payload_len_text = (
+                    str(payload_len) if payload_len is not None else "nieznana"
+                )
+                msg = (
+                    f"[PAKIET PROTOKOŁU] odebrany typ={ptn}, długość={payload_len_text}"
+                )
             else:
                 msg = f"[PAKIET PROTOKOŁU] odebrany typ={ptn}"
             if _gui_log_callback:
@@ -200,13 +272,22 @@ class BrokerMonitorPlugin(BasePlugin):
 
     def _handle_sudden_disconnect(self, client_id: str, client_session):
         """Sprawdza maszynę stanów sesji i wykrywa nagłą utratę połączenia."""
-        # Jeśli sesja weszła w stan 'disconnected', ale klient NIE wysłał pakietu DISCONNECT
-        if not getattr(client_session, 'clean_disconnect', False):
-            msg = f"[BROKER INTERFEJS] ⚠️ UTRACONO POŁĄCZENIE z klientem: ID={client_id} (KeepAlive timeout / brak sieci)"
+        # Jeśli sesja weszła w stan 'disconnected',
+        # ale klient NIE wysłał pakietu DISCONNECT
+        if not getattr(client_session, "clean_disconnect", False):
+            msg = (
+                "[BROKER INTERFEJS] ⚠️ UTRACONO POŁĄCZENIE z klientem: "
+                f"ID={client_id} (KeepAlive timeout / brak sieci)"
+            )
             if _gui_log_callback:
                 _gui_log_callback(msg)
 
-BROKER_PLUGIN_NAME = __name__ + ".BrokerMonitorPlugin" if __name__ != "__main__" else "__main__.BrokerMonitorPlugin"
+
+BROKER_PLUGIN_NAME = (
+    __name__ + ".BrokerMonitorPlugin"
+    if __name__ != "__main__"
+    else "__main__.BrokerMonitorPlugin"
+)
 BROKER_PASSWD_PATH = os.path.join(os.path.dirname(__file__) or ".", "passwd.txt")
 
 BROKER_CONFIG = {
@@ -224,9 +305,10 @@ BROKER_CONFIG = {
             "password_file": BROKER_PASSWD_PATH
         },
         # Rejestrujemy naszą własną klasę wtyczki
-        BROKER_PLUGIN_NAME: {}
-    }
+        BROKER_PLUGIN_NAME: {},
+    },
 }
+
 
 async def main(page: ft.Page):
     global _gui_log_callback
@@ -237,25 +319,22 @@ async def main(page: ft.Page):
     page.vertical_alignment = ft.MainAxisAlignment.START
     page.window.width = 700
     page.window.height = 500
-    
-    # broker = Broker(BROKER_CONFIG)
-    shutdown_event = asyncio.Event()
+
     # Generacja haseł dla użytkowników w pliku passwd.txt:
     # 1. Utwórz plik passwd.txt w tym samym katalogu co asyncBroker.py
-    # 2. W terminalu uruchom poniższe polecenia (zmień użytkownika i hasło): 
-    #    python -c "from pwdlib import PasswordHash; print(PasswordHash.recommended().hash('tu_wstaw_haslo'))"
-
-    # PAMIĘTAJ: Zmień na swój adres IP Wi-Fi, jeśli uruchamiasz na innym urządzeniu!
-    BROKER_URL = "mqtt://moj_uzytkownik:super_tajne_haslo@192.168.1.20:1883/"
-    SUBSCRIBE_TOPIC = "test/topic/#"
-    PUBLISH_TOPIC = "test/topic"
+    # 2. W terminalu uruchom poniższe polecenia (zmień użytkownika i hasło):
+    #    python -c "from pwdlib import PasswordHash;
+    #    print(PasswordHash.recommended().hash('tu_wstaw_haslo'))"
+    #    (polecenie wpisz w jednej linii)
 
     # Prosta flaga: dopóki True, piszemy do okna. Po zamknięciu przełączamy na print()
     is_gui_active = True
 
     # --- Elementy interfejsu ---
-    log_column = ft.Column(scroll=ft.ScrollMode.AUTO, auto_scroll = True, expand=True)
-    status_text = ft.Text("Status Brokera: Wyłączony", color=ft.Colors.RED, weight=ft.FontWeight.BOLD)
+    log_column = ft.Column(scroll=ft.ScrollMode.AUTO, auto_scroll=True, expand=True)
+    status_text = ft.Text(
+        "Status Brokera: Wyłączony", color=ft.Colors.RED, weight=ft.FontWeight.BOLD
+    )
 
     # --- POPRAWIONA FUNKCJA LOGOWANIA ---
     def log_message(text: str, *, level: str = "INFO", color: str | None = None):
@@ -269,10 +348,12 @@ async def main(page: ft.Page):
         final_text = f"{prefix} {text}"
         if is_gui_active:
             try:
-                log_column.controls.append(ft.Text(final_text, color=color if color else ft.Colors.ON_SURFACE))
+                log_column.controls.append(
+                    ft.Text(final_text, color=color if color else ft.Colors.ON_SURFACE)
+                )
                 log_column.scroll_to(offset=999999, duration=0)
                 page.update()
-            except Exception:
+            except Exception:  # noqa: BLE001 - dowolny błąd GUI (np. zamknięte okno) przełącza logowanie na terminal
                 is_gui_active = False
                 print(f"[Terminal]: {final_text}")
         else:
@@ -280,24 +361,25 @@ async def main(page: ft.Page):
 
     # Rejestrujemy callback dla wtyczki, aby miała dostęp do zapisu logów w GUI
     _gui_log_callback = log_message
-    
+
     def status_message(text: str):
         nonlocal is_gui_active
         if is_gui_active:
             try:
                 if text == "Status Brokera: DZIAŁA":
                     status_text.color = ft.Colors.GREEN
-                elif text in {"Status Brokera: ZAMKNIĘTY", "Status Brokera: Zatrzymany", "Status Brokera: BŁĄD STARTU"}:
+                elif text in {
+                    "Status Brokera: ZAMKNIĘTY",
+                    "Status Brokera: Zatrzymany",
+                    "Status Brokera: BŁĄD STARTU",
+                    "Status Brokera: BŁĄD ZAMYKANIA",
+                }:
                     status_text.color = ft.Colors.RED
-                elif text == "Status Brokera: Zatrzymywanie...":
-                    status_text.color = ft.Colors.ORANGE
-                elif text == "Status Brokera: Uruchamianie...":
-                    status_text.color = ft.Colors.ORANGE
                 else:
                     status_text.color = ft.Colors.ORANGE
                 status_text.value = text
                 page.update()
-            except Exception:
+            except Exception:  # noqa: BLE001 - dowolny błąd GUI (np. zamknięte okno) przełącza logowanie na terminal
                 is_gui_active = False
                 print(f"[Terminal]: {text}")
         else:
@@ -307,7 +389,7 @@ async def main(page: ft.Page):
         start_btn.disabled = False
         stop_btn.disabled = True
         page.update()
-    
+
     _gui_status_callback = status_message
 
     broker_instance = None
@@ -315,47 +397,98 @@ async def main(page: ft.Page):
     broker_stop_event: asyncio.Event | None = None
 
     def moj_log_polaczenia():
-        log_message("Testowy log uruchomienia brokera MQTT", level="OK", color=ft.Colors.GREEN)
+        log_message(
+            "Testowy log uruchomienia brokera MQTT", level="OK", color=ft.Colors.GREEN
+        )
         status_message("Status Brokera: DZIAŁA")
-        
+
     def moj_log_rozlaczenia():
-        log_message("Testowy log zatrzymania brokera MQTT", level="INFO", color=ft.Colors.BLUE)
+        log_message(
+            "Testowy log zatrzymania brokera MQTT", level="INFO", color=ft.Colors.BLUE
+        )
         status_message("Status Brokera: Zatrzymany")
-        
+
     async def start_broker_task(stop_event: asyncio.Event):
         nonlocal broker_instance, broker_task, broker_stop_event
         broker_instance = None
+        final_status = "Status Brokera: Zatrzymany"
         try:
             broker_instance = Broker(BROKER_CONFIG)
             broker_instance.transitions.on_enter_started(moj_log_polaczenia)
-            broker_instance.transitions.on_enter_stopping(lambda: status_message("Status Brokera: Zatrzymywanie..."))
+            broker_instance.transitions.on_enter_stopping(
+                lambda: status_message("Status Brokera: Zatrzymywanie...")
+            )
             broker_instance.transitions.on_enter_stopped(moj_log_rozlaczenia)
-            broker_instance.transitions.on_exit_started(lambda: log_message("[BROKER] wyjście ze stanu started"))
+            broker_instance.transitions.on_exit_started(
+                lambda: log_message("[BROKER] wyjście ze stanu started")
+            )
 
             await broker_instance.start()
             status_message("Status Brokera: DZIAŁA")
             await stop_event.wait()
         except asyncio.CancelledError:
-            log_message("Wątek brokera został anulowany.", level="WARN", color=ft.Colors.ORANGE)
-            status_message("Status Brokera: Zatrzymany")
+            log_message(
+                "Wątek brokera został anulowany.", level="WARN", color=ft.Colors.ORANGE
+            )
+            raise
         except Exception as exc:
-            log_message(f"Błąd startu lub pracy brokera: {exc}", level="ERROR", color=ft.Colors.RED)
-            status_message("Status Brokera: BŁĄD STARTU")
+            log_message(
+                f"Błąd startu lub pracy brokera: {exc}",
+                level="ERROR",
+                color=ft.Colors.RED,
+            )
+            logging.getLogger(__name__).exception(
+                "Błąd podczas uruchamiania lub pracy brokera."
+            )
+            final_status = "Status Brokera: BŁĄD STARTU"
         finally:
             if broker_instance is not None:
+                broker_state = broker_instance.transitions.state
+                if broker_state == "started":
+                    try:
+                        await broker_instance.shutdown()
+                    except Exception as exc:
+                        log_message(
+                            f"Shutdown zakończony błędem: {exc}",
+                            level="ERROR",
+                            color=ft.Colors.RED,
+                        )
+                        logging.getLogger(__name__).exception(
+                            "Nie udało się zamknąć brokera."
+                        )
+                        if final_status == "Status Brokera: Zatrzymany":
+                            final_status = "Status Brokera: BŁĄD ZAMYKANIA"
+                elif broker_state != "stopped":
+                    log_message(
+                        f"Broker nie osiągnął stanu 'started' (stan: {broker_state}); "
+                        "pomijam wywołanie shutdown.",
+                        level="WARN",
+                        color=ft.Colors.ORANGE,
+                    )
+            try:
+                status_message(final_status)
+            finally:
                 try:
-                    await broker_instance.shutdown()
-                except Exception as exc:
-                    log_message(f"Shutdown zakończony błędem: {exc}", level="ERROR", color=ft.Colors.RED)
-            status_message("Status Brokera: Zatrzymany")
-            reset_broker_controls()
-            broker_instance = None
-            broker_task = None
-            broker_stop_event = None
+                    reset_broker_controls()
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Nie udało się przywrócić stanu kontrolek brokera."
+                    )
+                    log_message(
+                        "Nie udało się przywrócić stanu kontrolek brokera.",
+                        level="ERROR",
+                        color=ft.Colors.RED,
+                    )
+                finally:
+                    broker_instance = None
+                    broker_task = None
+                    broker_stop_event = None
 
     start_btn = ft.Button(content="Uruchom", icon=ft.Icons.PLAY_ARROW)
     stop_btn = ft.Button(content="Zatrzymaj", icon=ft.Icons.STOP, disabled=True)
-    clear_log_btn = ft.Button(content="Wyczyść log", icon=ft.Icons.CLEANING_SERVICES_ROUNDED)
+    clear_log_btn = ft.Button(
+        content="Wyczyść log", icon=ft.Icons.CLEANING_SERVICES_ROUNDED
+    )
 
     def clear_log(e):
         log_column.controls.clear()
@@ -382,13 +515,17 @@ async def main(page: ft.Page):
     start_btn.on_click = on_start
     stop_btn.on_click = on_stop
     clear_log_btn.on_click = clear_log
-    
+
     page.add(
         ft.Container(
             content=ft.Column(
                 [
                     ft.Text("Panel Brokera MQTT", size=20, weight=ft.FontWeight.BOLD),
-                    ft.Row([start_btn, stop_btn, clear_log_btn, status_text], alignment=ft.MainAxisAlignment.START, spacing=20),
+                    ft.Row(
+                        [start_btn, stop_btn, clear_log_btn, status_text],
+                        alignment=ft.MainAxisAlignment.START,
+                        spacing=20,
+                    ),
                     ft.Text("Wiadomości:", weight=ft.FontWeight.BOLD),
                     ft.Container(
                         content=log_column,
@@ -396,6 +533,7 @@ async def main(page: ft.Page):
                         border_radius=5,
                         padding=10,
                         height=250,
+                        width=650,
                         expand=True,
                     ),
                 ],
@@ -416,13 +554,27 @@ async def main(page: ft.Page):
                 try:
                     await broker_task
                 except asyncio.CancelledError:
-                    pass
+                    log_message(
+                        "Zadanie brokera zostało anulowane podczas zamykania okna.",
+                        level="WARN",
+                        color=ft.Colors.ORANGE,
+                    )
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Nieobsłużony błąd podczas zamykania brokera."
+                    )
+                    log_message(
+                        "Wystąpił błąd podczas zamykania brokera.",
+                        level="ERROR",
+                        color=ft.Colors.RED,
+                    )
                 finally:
                     await page.window.destroy()
             else:
                 await page.window.destroy()
 
     page.window.on_event = on_window_event
+
 
 if __name__ == "__main__":
     ft.run(main)
